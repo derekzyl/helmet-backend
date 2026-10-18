@@ -227,7 +227,7 @@ async def main():
     args = parser.parse_args()
 
     sim = HardwareSimulator(base_url=args.url)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         await sim.setup_devices(client)
         if args.scenario in ["pre_ride", "all"]:
             await sim.run_scenario_pre_ride(client)
