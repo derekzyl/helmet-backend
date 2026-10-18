@@ -93,6 +93,35 @@ async def test_device_pairing(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_register_as_one_device_system(client: AsyncClient):
+    """Test that helmet and ignition go together and register as 1 unified system device."""
+    res = await client.post(
+        "/api/v1/devices/system",
+        json={
+            "serial_number": "HLM-KIT-0099",
+            "ignition_serial": "IGN-KIT-0099",
+            "label": "Roadster Kit #99",
+            "device_type": "SMART_HELMET_SYSTEM",
+        },
+    )
+    assert res.status_code == 201
+    data = res.json()
+    assert data["serial_number"] == "HLM-KIT-0099"
+    assert data["ignition_serial"] == "IGN-KIT-0099"
+    assert data["status"] == "ONLINE"
+    assert len(data["pairing_secret"]) == 64
+
+    # Verify that listing devices lists the kit as 1 device
+    res_list = await client.get("/api/v1/devices/")
+    assert res_list.status_code == 200
+    all_devs = res_list.json()
+    kit_dev = next((d for d in all_devs if d["serial_number"] == "HLM-KIT-0099"), None)
+    assert kit_dev is not None
+    assert kit_dev["ignition_serial"] == "IGN-KIT-0099"
+
+
+
+@pytest.mark.asyncio
 async def test_device_config_update(client: AsyncClient):
     res_cfg = await client.put(
         "/api/v1/devices/HLM-TEST-0001/config",

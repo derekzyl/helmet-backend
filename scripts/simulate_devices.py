@@ -16,12 +16,8 @@ import asyncio
 import hashlib
 import hmac
 import json
-import math
-import sys
 import time
-from datetime import datetime, timezone
 import httpx
-import websockets
 
 API_BASE_URL = "https://big-mariejeanne-cybergenii-b60e7032.koyeb.app/api/v1"
 WS_URL = "wss://big-mariejeanne-cybergenii-b60e7032.koyeb.app/api/v1/ws/live"
@@ -43,52 +39,36 @@ class HardwareSimulator:
         self.speed = 0.0
 
     async def setup_devices(self, client: httpx.AsyncClient):
-        print(f"[*] Registering Helmet Unit ({self.helmet_serial})...")
+        print(f"[*] Registering Smart Helmet & Ignition as 1 Unified Device System ({self.helmet_serial} <===> {self.ignition_serial})...")
         try:
             r = await client.post(
-                f"{self.base_url}/devices/register",
+                f"{self.base_url}/devices/system",
                 json={
                     "serial_number": self.helmet_serial,
-                    "device_type": "HELMET",
+                    "ignition_serial": self.ignition_serial,
+                    "device_type": "SMART_HELMET_SYSTEM",
                     "hardware_version": "v1.2-38pin",
                     "firmware_version": "1.0.0",
-                    "label": "Test Helmet Unit #1",
+                    "label": "Roadster Kit #1",
                 },
             )
             print(f"    -> Result: {r.status_code}")
+            if r.status_code in (200, 201):
+                data = r.json()
+                self.pairing_secret = data.get("pairing_secret")
+                print(f"    -> 1-Device System Provisioned & Paired! PSK: {self.pairing_secret[:16]}...")
         except Exception as e:
-            print(f"    -> Registration notice: {e}")
+            print(f"    -> System registration notice: {e}")
 
-        print(f"[*] Registering Ignition Unit ({self.ignition_serial})...")
-        try:
-            r = await client.post(
-                f"{self.base_url}/devices/register",
-                json={
-                    "serial_number": self.ignition_serial,
-                    "device_type": "IGNITION",
-                    "hardware_version": "v1.0",
-                    "firmware_version": "1.0.0",
-                    "label": "Bike Ignition Unit #1",
-                },
-            )
-            print(f"    -> Result: {r.status_code}")
-        except Exception as e:
-            print(f"    -> Registration notice: {e}")
+        if not self.pairing_secret:
+            try:
+                r = await client.get(f"{self.base_url}/devices/{self.helmet_serial}")
+                if r.status_code == 200:
+                    self.pairing_secret = r.json().get("pairing_secret")
+            except Exception:
+                pass
 
-        print("[*] Pairing Helmet and Ignition...")
-        try:
-            r = await client.post(
-                f"{self.base_url}/devices/pair",
-                json={
-                    "helmet_device_id": self.helmet_serial,
-                    "ignition_device_id": self.ignition_serial,
-                },
-            )
-            data = r.json()
-            self.pairing_secret = data.get("pairing_secret")
-            print(f"    -> Paired successfully! PSK: {self.pairing_secret[:16]}...")
-        except Exception as e:
-            print(f"    -> Pairing fallback: {e}")
+        if not self.pairing_secret:
             self.pairing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
     def compute_hmac(self, msg_type: str, data_dict: dict) -> str:
@@ -166,6 +146,7 @@ class HardwareSimulator:
         print("Step 2: MPU-6050 detects 4.8G impact + 75° tilt shift + sudden stop...")
         self.speed = 0.0
         sig = self.compute_hmac("EMERGENCY_ALERT", {"event": "COLLISION", "impact_g": 4.8})
+        print(f"  -> Generated HMAC-SHA256 interlock signature: {sig[:16]}...")
         print("  -> Pre-alert alarm activated! Piezo buzzer sounds 20-second warning countdown.")
         print("  -> (Button A would cancel false alarm). Simulating rider unable to cancel...")
         await asyncio.sleep(2)

@@ -18,11 +18,13 @@ device_router = APIRouter()
 
 
 @device_router.post("/register", response_model=DeviceResponse, status_code=201)
+@device_router.post("/system", response_model=DeviceResponse, status_code=201)
+@device_router.post("/register-system", response_model=DeviceResponse, status_code=201)
 async def register_device(
     data: DeviceRegisterRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Register a new smart helmet or bike ignition device."""
+    """Register a Smart Helmet and Motorcycle Ignition together as 1 cohesive system device."""
     device = await DeviceService(db=db).register_device(data=data)
     return device
 
@@ -30,10 +32,11 @@ async def register_device(
 @device_router.get("/", response_model=List[DeviceResponse])
 async def list_devices(
     db: Annotated[AsyncSession, Depends(get_db)],
-    device_type: Optional[str] = Query(None, description="Filter by HELMET or IGNITION"),
+    device_type: Optional[str] = Query(None, description="Filter by device type"),
+    all_components: bool = Query(False, description="If True, returns raw underlying hardware components separately"),
 ):
-    """List registered devices in the fleet."""
-    devices = await DeviceService(db=db).list_devices(device_type=device_type)
+    """List registered devices in the fleet (presents 1 device per paired Smart Helmet System by default)."""
+    devices = await DeviceService(db=db).list_devices(device_type=device_type, all_components=all_components)
     return devices
 
 
@@ -52,7 +55,7 @@ async def pair_devices(
     data: DevicePairRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Cryptographically pair a helmet unit with an ignition unit and generate the 256-bit PSK."""
+    """Explicitly pair a helmet unit with an ignition unit and generate the 256-bit PSK."""
     pair_res = await DeviceService(db=db).pair_devices(data=data)
     return pair_res
 

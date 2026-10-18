@@ -4,11 +4,24 @@ from pydantic import BaseModel, Field
 
 
 class DeviceRegisterRequest(BaseModel):
-    serial_number: str = Field(..., example="HLM-2026-0001")
-    device_type: str = Field(..., example="HELMET", description="HELMET or IGNITION")
+    serial_number: str = Field(..., example="HLM-2026-0001", description="Serial number of the Smart Helmet unit")
+    ignition_serial: Optional[str] = Field(default=None, example="IGN-2026-0001", description="Optional serial number of the paired ignition relay (auto-generated if omitted)")
+    device_type: Optional[str] = Field(default="SMART_HELMET_SYSTEM", example="SMART_HELMET_SYSTEM", description="SMART_HELMET_SYSTEM, HELMET, or IGNITION")
     hardware_version: str = Field(default="v1.0")
     firmware_version: str = Field(default="1.0.0")
-    label: Optional[str] = Field(default=None, example="Main Rider Helmet")
+    label: Optional[str] = Field(default=None, example="Primary Smart Helmet & Ignition Unit")
+    alcohol_threshold_mg_l: Optional[float] = Field(default=0.05, ge=0.0, le=1.0)
+    collision_accel_g: Optional[float] = Field(default=3.5, ge=1.5, le=16.0)
+
+
+class SystemRegisterRequest(BaseModel):
+    label: Optional[str] = Field(default=None, example="Primary Smart Helmet & Ignition Unit")
+    helmet_serial: str = Field(..., example="HLM-2026-0001", description="Serial number of the helmet unit")
+    ignition_serial: Optional[str] = Field(default=None, example="IGN-2026-0001", description="Serial number of paired ignition box (auto-generated if omitted)")
+    hardware_version: str = Field(default="v1.0")
+    firmware_version: str = Field(default="1.0.0")
+    alcohol_threshold_mg_l: Optional[float] = Field(default=0.05, ge=0.0, le=1.0)
+    collision_accel_g: Optional[float] = Field(default=3.5, ge=1.5, le=16.0)
 
 
 class DevicePairRequest(BaseModel):
@@ -58,6 +71,9 @@ class DeviceResponse(BaseModel):
     last_latitude: Optional[float] = None
     last_longitude: Optional[float] = None
     paired_device_id: Optional[str] = None
+    paired_serial_number: Optional[str] = None
+    ignition_serial: Optional[str] = None
+    pairing_secret: Optional[str] = None
     config: Optional[DeviceConfigResponse] = None
     created_at: datetime
     updated_at: datetime
