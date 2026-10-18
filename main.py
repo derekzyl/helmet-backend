@@ -12,7 +12,7 @@ async def root():
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content=response_message(
-            data="Welcome to FastAPI SQLAlchemy Starter",
+            data="Welcome to Smart Helmet",
             success_status=True,
             message="success",
         ),

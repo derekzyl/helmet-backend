@@ -6,11 +6,15 @@ from fastapi import HTTPException, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config.env import env
+from app.core.contacts.models.model_contact import EmergencyContactModel
 from app.core.devices.models.model_device import DeviceModel
 from app.core.events.models.model_event import SafetyEventModel
 from app.core.events.types.type_event import SafetyEventCreate
 from app.core.telemetry.websocket_hub import telemetry_ws_hub
+from app.core.users.models.model_user import UserModel
 from app.utils.logger.log import logs
+from app.utils.mail.mailer import EmailTemplateTypesEnum, SMTPMailer
 
 
 class SafetyEventService:
@@ -56,6 +60,54 @@ class SafetyEventService:
                 "created_at": event.created_at.isoformat(),
             },
         )
+
+        # Dispatch email alert if email service is active
+        if env.get("mail", {}).get("use_mail_service") or env.get("mail", {}).get("use_credentials"):
+            try:
+                recipients = []
+                admin_email = env.get("mail", {}).get("mail_username") or env.get("mail", {}).get("mail_sender")
+                if admin_email:
+                    recipients.append(admin_email)
+
+                # Query emergency contacts and linked user emails
+                stmt_contacts = select(EmergencyContactModel).where(
+                    (EmergencyContactModel.device_id == device_db_id) | (EmergencyContactModel.is_primary.is_(True))
+                )
+                res_contacts = await self.db.execute(stmt_contacts)
+                for contact in res_contacts.scalars().all():
+                    if contact.user_id:
+                        stmt_u = select(UserModel.email).where(UserModel.id == contact.user_id)
+                        res_u = await self.db.execute(stmt_u)
+                        u_email = res_u.scalar_one_or_none()
+                        if u_email:
+                            recipients.append(u_email)
+
+                google_maps_url = (
+                    f"https://maps.google.com/?q={event.latitude},{event.longitude}"
+                    if event.latitude and event.longitude else None
+                )
+                if data.payload and isinstance(data.payload, dict) and "google_maps_url" in data.payload:
+                    google_maps_url = data.payload["google_maps_url"]
+
+                if recipients:
+                    mailer = SMTPMailer(
+                        receiver_emails=list(set(recipients)),
+                        template_name=EmailTemplateTypesEnum.EMERGENCY_ALERT,
+                        subject=f"🚨 [{event.severity}] Smart Helmet Alert: {event.event_type}",
+                        template_data={
+                            "event_type": event.event_type,
+                            "severity": event.severity,
+                            "device_id": device.serial_number if device else data.device_id,
+                            "message": event.message,
+                            "google_maps_url": google_maps_url,
+                            "timestamp": event.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        },
+                        background=False,
+                    )
+                    await mailer.send_mail()
+                    logs.info(f"📧 Emergency alert email dispatched to {recipients}")
+            except Exception as e:
+                logs.error(f"Failed to dispatch emergency email alert: {e}")
 
         return event
 

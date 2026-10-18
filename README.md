@@ -1,4 +1,4 @@
-# FastAPI SQLAlchemy Starter
+# Smart Helmet
 
 A production-shaped **FastAPI + async SQLAlchemy** backend template.
 

@@ -19,28 +19,30 @@ class EmailTemplateTypesEnum(str, Enum):
     RESET_PASSWORD = "reset_password"
     PASSWORD_CHANGE = "password_change"
     WELCOME = "welcome"
+    EMERGENCY_ALERT = "emergency_alert"
 
 
 class SMTPMailer:
     def __init__(
         self,
-        background_tasks: BackgroundTasks,
-        receiver_emails: List[EmailStr],
-        template_name: EmailTemplateTypesEnum,
-        subject: str,
-        template_data: dict[str, Any],
+        background_tasks: BackgroundTasks = None,
+        receiver_emails: List[EmailStr] = None,
+        template_name: EmailTemplateTypesEnum = EmailTemplateTypesEnum.WELCOME,
+        subject: str = "Smart Helmet Notification",
+        template_data: dict[str, Any] = None,
         background: bool = False,
     ):
         self.sender_email: EmailStr = env.env["mail"]["mail_sender"]
+        self.sender_username = env.env["mail"].get("mail_username") or self.sender_email
         self.sender_password = env.env["mail"]["mail_password"]
         self.smtp_server = env.env["mail"]["mail_server"]
         self.smtp_port = env.env["mail"]["mail_port"]
         self.background = background
         self.background_tasks = background_tasks
-        self.receiver_emails = receiver_emails
+        self.receiver_emails = receiver_emails or []
         self.subject = subject
         self.template_name = template_name
-        self.template_data = template_data
+        self.template_data = template_data or {}
 
     def _get_html_content(self) -> str:
         template_env = Environment(loader=DictLoader(EMAIL_TEMPLATES))
@@ -50,18 +52,18 @@ class SMTPMailer:
     def _create_message(self, receiver_email: str) -> MIMEMultipart:
         message = MIMEMultipart("alternative")
         message["Subject"] = self.subject
-        message["From"] = self.sender_email
+        message["From"] = f"{env.env['mail'].get('mail_sender_name', 'Smart Helmet Safety')} <{self.sender_email}>"
         message["To"] = receiver_email
         message.attach(MIMEText(self._get_html_content(), "html"))
         return message
 
     def _send_sync(self) -> None:
         context = ssl.create_default_context()
-        with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+        with smtplib.SMTP(self.smtp_server, int(self.smtp_port), timeout=15) as server:
             if env.env["mail"].get("mail_use_tls", True):
                 server.starttls(context=context)
             if env.env["mail"].get("use_credentials", True):
-                server.login(self.sender_email, self.sender_password)
+                server.login(self.sender_username, self.sender_password)
             for receiver in self.receiver_emails:
                 server.sendmail(
                     self.sender_email,

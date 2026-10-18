@@ -16,7 +16,7 @@ from app.versions.route_handler import handle_routing
 
 def init_app(init_db=True):
     app: FastAPI = FastAPI(
-        title="FastAPI SQLAlchemy Starter",
+        title="Smart Helmet",
         description="A clean FastAPI + async SQLAlchemy starter with auth, users, and RBAC scaffolding.",
         version="0.1.0",
         default_response_class=ORJSONResponse,
@@ -29,6 +29,7 @@ def init_app(init_db=True):
         "http://localhost:8080",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
+        "https://helmet-dashboard-nine.vercel.app",
     ]
     allow_origin_regex = r"http(s)?://(localhost|127\.0\.0\.1)(:\d+)?"
 
@@ -108,6 +109,7 @@ def init_app(init_db=True):
     handle_routing(app=app)
 
     from app.core.telemetry.routes.routes_telemetry import telemetry_websocket_endpoint
+
     app.add_api_websocket_route("/api/v1/ws/live", telemetry_websocket_endpoint)
 
     return app
