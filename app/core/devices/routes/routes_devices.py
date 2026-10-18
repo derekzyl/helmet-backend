@@ -12,6 +12,7 @@ from app.core.devices.types.type_device import (
     DevicePairResponse,
     DeviceRegisterRequest,
     DeviceResponse,
+    EasyInstallRequest,
 )
 
 device_router = APIRouter()
@@ -27,6 +28,27 @@ async def register_device(
     """Register a Smart Helmet and Motorcycle Ignition together as 1 cohesive system device."""
     device = await DeviceService(db=db).register_device(data=data)
     return device
+
+
+@device_router.post("/easy-install", response_model=DeviceResponse, status_code=201)
+@device_router.post("/quick-pair", response_model=DeviceResponse, status_code=201)
+async def easy_install_device(
+    data: EasyInstallRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Zero-friction 1-tap installation using nearby discovery, QR code, or short 4-digit code."""
+    device = await DeviceService(db=db).easy_install(data=data)
+    return device
+
+
+@device_router.get("/discover", response_model=List[dict])
+async def discover_devices(
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Scan and list nearby broadcasting unprovisioned Smart Helmet systems."""
+    devices = await DeviceService(db=db).get_discoverable_devices()
+    return devices
+
 
 
 @device_router.get("/", response_model=List[DeviceResponse])

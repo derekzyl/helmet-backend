@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -119,6 +118,43 @@ async def test_register_as_one_device_system(client: AsyncClient):
     assert kit_dev is not None
     assert kit_dev["ignition_serial"] == "IGN-KIT-0099"
 
+
+@pytest.mark.asyncio
+async def test_easy_install_flow(client: AsyncClient):
+    """Test zero-friction easy installation via nearby discovery and short code."""
+    # 1. Discover nearby broadcasting units
+    res_disc = await client.get("/api/v1/devices/discover")
+    assert res_disc.status_code == 200
+    disc_list = res_disc.json()
+    assert len(disc_list) > 0
+    assert "kit_code" in disc_list[0]
+
+    # 2. Easy install using short 4-digit code and friendly name
+    res_install = await client.post(
+        "/api/v1/devices/easy-install",
+        json={
+            "short_code": "8492",
+            "label": "Ducati Monster Kit",
+            "vehicle_type": "Motorcycle",
+            "safety_preset": "STRICT",
+        },
+    )
+    assert res_install.status_code == 201
+    installed = res_install.json()
+    assert installed["serial_number"] == "HLM-8492"
+    assert installed["ignition_serial"] == "IGN-8492"
+    assert len(installed["pairing_secret"]) == 64
+    assert installed["config"]["alcohol_threshold_mg_l"] == 0.02  # STRICT preset
+
+    # 3. 1-Tap Auto Install with no serial or codes
+    res_auto = await client.post(
+        "/api/v1/devices/easy-install",
+        json={"label": "Commuter Scooter"},
+    )
+    assert res_auto.status_code == 201
+    auto_kit = res_auto.json()
+    assert auto_kit["serial_number"].startswith("HLM-")
+    assert auto_kit["ignition_serial"].startswith("IGN-")
 
 
 @pytest.mark.asyncio

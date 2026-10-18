@@ -13,6 +13,7 @@ from app.core.devices.types.type_device import (
     DevicePairRequest,
     DevicePairResponse,
     DeviceRegisterRequest,
+    EasyInstallRequest,
 )
 from app.utils.logger.log import logs
 
@@ -27,9 +28,9 @@ class DeviceService:
         # If registering a unified Smart Helmet & Ignition Kit (1 device)
         if device_type_upper in ("SMART_HELMET_SYSTEM", "SYSTEM", "HELMET_IGNITION_KIT") or (
             device_type_upper == "HELMET" and data.ignition_serial
-        ):
+        ) or not data.serial_number:
             return await self.register_system_kit(
-                helmet_serial=data.serial_number,
+                helmet_serial=data.serial_number or "",
                 ignition_serial=data.ignition_serial,
                 label=data.label,
                 hardware_version=data.hardware_version,
@@ -73,6 +74,83 @@ class DeviceService:
         logs.info(f"Registered device {device.serial_number} ({device.device_type})")
         return device
 
+    async def easy_install(self, data: EasyInstallRequest, owner_id: Optional[str] = None) -> DeviceModel:
+        """Zero-friction smart helmet system installation using short code, QR payload, or 1-tap auto-discovery."""
+        target_code = None
+        if data.short_code and data.short_code.strip():
+            target_code = data.short_code.strip().replace("-", "").replace(" ", "")
+        elif data.qr_payload and data.qr_payload.strip():
+            raw = data.qr_payload.strip()
+            if "code=" in raw:
+                target_code = raw.split("code=")[-1].split("&")[0]
+            elif ":" in raw:
+                parts = raw.split(":")
+                target_code = parts[1] if len(parts) > 1 else parts[0]
+            else:
+                target_code = raw
+        elif data.serial_number and data.serial_number.strip():
+            target_code = data.serial_number.strip()
+        else:
+            target_code = str(secrets.randbelow(9000) + 1000)
+
+        clean_code = target_code.upper().replace("HLM-", "").replace("HLM", "")
+        if not clean_code:
+            clean_code = str(secrets.randbelow(9000) + 1000)
+
+        helmet_sn = f"HLM-{clean_code}"
+        ignition_sn = f"IGN-{clean_code}"
+
+        preset = (data.safety_preset or "STANDARD").upper()
+        if preset == "STRICT":
+            alc_th = 0.02
+            col_th = 2.5
+        elif preset in ("TRACK", "SPORT", "OFFROAD"):
+            alc_th = 0.05
+            col_th = 5.0
+        else:
+            alc_th = 0.05
+            col_th = 3.5
+
+        friendly_label = data.label.strip() if data.label and data.label.strip() else f"{data.vehicle_type or 'Motorcycle'} Kit #{clean_code}"
+
+        return await self.register_system_kit(
+            helmet_serial=helmet_sn,
+            ignition_serial=ignition_sn,
+            label=friendly_label,
+            hardware_version="v1.2-esp32",
+            firmware_version="1.0.0",
+            alcohol_threshold_mg_l=alc_th,
+            collision_accel_g=col_th,
+            owner_id=owner_id,
+        )
+
+    async def get_discoverable_devices(self) -> List[dict]:
+        """Simulate real-time Bluetooth LE / SoftAP nearby advertising detection."""
+        stmt = select(DeviceModel.serial_number)
+        res = await self.db.execute(stmt)
+        registered_sns = set(res.scalars().all())
+
+        candidates = [
+            {"kit_code": "8492", "label": "Vanguard Pro Helmet Kit", "rssi_dbm": -42, "battery": 94},
+            {"kit_code": "3917", "label": "AeroSport Helmet Kit", "rssi_dbm": -58, "battery": 88},
+            {"kit_code": "7204", "label": "Urban Cruiser Helmet Kit", "rssi_dbm": -71, "battery": 100},
+        ]
+
+        discoverable = []
+        for c in candidates:
+            hlm_sn = f"HLM-{c['kit_code']}"
+            if hlm_sn not in registered_sns:
+                discoverable.append({
+                    "kit_code": c["kit_code"],
+                    "serial_number": hlm_sn,
+                    "ignition_serial": f"IGN-{c['kit_code']}",
+                    "label": c["label"],
+                    "rssi_dbm": c["rssi_dbm"],
+                    "battery_pct": c["battery"],
+                    "ready_to_pair": True,
+                })
+        return discoverable
+
     async def register_system_kit(
         self,
         helmet_serial: str,
@@ -85,7 +163,18 @@ class DeviceService:
         owner_id: Optional[str] = None,
     ) -> DeviceModel:
         """Register Smart Helmet and Motorcycle Ignition together as 1 cohesive device."""
-        helmet_sn = helmet_serial.strip()
+        if not helmet_serial or not str(helmet_serial).strip():
+            short_num = secrets.randbelow(9000) + 1000
+            helmet_sn = f"HLM-{short_num}"
+        else:
+            raw_sn = str(helmet_serial).strip().upper()
+            if raw_sn.isdigit() and len(raw_sn) <= 6:
+                helmet_sn = f"HLM-{raw_sn}"
+            elif not raw_sn.startswith("HLM"):
+                helmet_sn = f"HLM-{raw_sn}"
+            else:
+                helmet_sn = raw_sn
+
         if not ignition_serial:
             if helmet_sn.startswith("HLM-"):
                 ignition_sn = "IGN-" + helmet_sn[4:]
@@ -94,7 +183,13 @@ class DeviceService:
             else:
                 ignition_sn = f"{helmet_sn}-IGN"
         else:
-            ignition_sn = ignition_serial.strip()
+            raw_ign = str(ignition_serial).strip().upper()
+            if raw_ign.isdigit() and len(raw_ign) <= 6:
+                ignition_sn = f"IGN-{raw_ign}"
+            elif not raw_ign.startswith("IGN"):
+                ignition_sn = f"IGN-{raw_ign}"
+            else:
+                ignition_sn = raw_ign
 
         # Check if either already registered
         stmt = select(DeviceModel).where(
@@ -113,6 +208,7 @@ class DeviceService:
             )
 
         psk = secrets.token_hex(32)
+
         system_label = label or f"Smart Helmet System ({helmet_sn})"
 
         # 1. Primary Helmet Unit
