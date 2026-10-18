@@ -1,0 +1,522 @@
+"""
+Optimized Queries module for high-performance database operations.
+This module provides enhanced query building with caching, connection pooling,
+and query optimization techniques.
+"""
+
+import hashlib
+import json
+import time
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import and_, func, not_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
+
+from app.utils.cache.redis_cache import cache_manager
+from app.utils.logger import log
+
+
+class OptimizedQueries:
+    """
+    High-performance query builder with caching and optimization features.
+    """
+    
+    def __init__(self, model_query: Select, request_query: Dict[str, Any], model_class):
+        self.model = model_query
+        self.request_query = request_query
+        self.model_class = model_class
+        self._query_cache = {}
+        self._compiled_cache = {}
+        
+    @lru_cache(maxsize=1000)
+    def _get_field_hash(self, field_name: str) -> str:
+        """Cache field lookups to avoid repeated hasattr calls."""
+        return hashlib.md5(f"{self.model_class.__name__}.{field_name}".encode()).hexdigest()
+    
+    @lru_cache(maxsize=500)
+    def _get_model_fields(self) -> Tuple[str, ...]:
+        """Cache model field names."""
+        return tuple(self.model_class.__table__.columns.keys())
+    
+    @lru_cache(maxsize=100)
+    def _get_model_relationships(self) -> Tuple[str, ...]:
+        """Cache model relationship names."""
+        relationships = []
+        for attr_name in dir(self.model_class):
+            if not attr_name.startswith('_'):
+                attr = getattr(self.model_class, attr_name)
+                if (hasattr(attr, 'property') and 
+                    hasattr(attr.property, 'mapper')):
+                    relationships.append(attr_name)
+        return tuple(relationships)
+    
+    def _generate_query_cache_key(self, operation: str) -> str:
+        """Generate a cache key for the query."""
+        query_data = {
+            'model': self.model_class.__name__,
+            'operation': operation,
+            'filters': self.request_query.get('filters', {}),
+            'sort': self.request_query.get('sort'),
+            'page': self.request_query.get('page', 1),
+            'limit': self.request_query.get('limit', 100),
+            'fields': self.request_query.get('fields')
+        }
+        return hashlib.md5(json.dumps(query_data, sort_keys=True).encode()).hexdigest()
+    
+    async def _get_cached_query(self, cache_key: str) -> Optional[Any]:
+        """Get cached query result."""
+        try:
+            cached_result = await cache_manager.get(cache_key)
+            if cached_result:
+                log.logs.debug(f"Cache hit for query: {cache_key}")
+                return json.loads(cached_result)
+        except Exception as e:
+            log.logs.warning(f"Cache retrieval error: {e}")
+        return None
+    
+    async def _set_cached_query(self, cache_key: str, result: Any, ttl: int = 300):
+        """Cache query result."""
+        try:
+            # Ensure result is serializable
+            if isinstance(result, list):
+                serializable_result = []
+                for item in result:
+                    if hasattr(item, 'to_dict') and not isinstance(item, (dict, str, bytes, int, float, bool)):
+                        serializable_result.append(item.to_dict())
+                    elif isinstance(item, dict):
+                        serializable_result.append(item)
+                    else:
+                        # Skip non-serializable items
+                        continue
+                await cache_manager.set(cache_key, json.dumps(serializable_result), ttl)
+            elif hasattr(result, 'to_dict') and not isinstance(result, (dict, str, bytes, int, float, bool)):
+                # Single SQLAlchemy object
+                await cache_manager.set(cache_key, json.dumps(result.to_dict()), ttl)
+            else:
+                await cache_manager.set(cache_key, json.dumps(result), ttl)
+            log.logs.debug(f"Cached query result: {cache_key}")
+        except Exception as e:
+            log.logs.warning(f"Cache storage error: {e}")
+    
+    def filter(self, use_cache: bool = False):
+        """
+        Optimized filter method with comprehensive performance logging.
+        """
+        filter_start = time.time()
+        log.logs.info(f"🔍 [PERF] OptimizedQueries.filter started for {self.model_class.__name__}")
+        
+        # Caching disabled - process filters directly
+        query_obj = self.request_query.copy()
+        excluded_fields = ["page", "sort", "limit", "fields"]
+        for field in excluded_fields:
+            query_obj.pop(field, None)
+
+        log.logs.info(f"📊 [PERF] Processing {len(query_obj)} filter conditions")
+
+        # Batch process filters for better performance
+        filter_conditions = []
+        mongodb_conditions = []
+        
+        condition_processing_start = time.time()
+        for key, value in query_obj.items():
+            try:
+                # Handle MongoDB-style operators
+                if isinstance(value, dict) and any(k.startswith("$") for k in value.keys()):
+                    log.logs.debug(f"🔍 [PERF] MongoDB operator: {key} with {len(value)} operators")
+                    mongodb_conditions.append((key, value))
+                # Handle Django-style filters
+                elif key.endswith(("__gte", "__gt", "__lte", "__lt", "__icontains", "__contains", "__in", "__nin")):
+                    condition = self._build_django_filter(key, value)
+                    if condition:
+                        filter_conditions.append(condition)
+                # Handle top-level MongoDB operators
+                elif key.startswith("$"):
+                    self._apply_top_level_mongodb_operators(key, value)
+                else:
+                    log.logs.debug(f"🔍 [PERF] Simple equality filter: {key}")
+                    # Simple equality filter
+                    if hasattr(self.model_class, key):
+                        filter_conditions.append(getattr(self.model_class, key) == value)
+                        
+            except Exception as e:
+                log.logs.error(f"Error applying filter for field '{key}': {e}")
+                continue
+
+        condition_processing_time = (time.time() - condition_processing_start) * 1000
+        log.logs.info(f"⏱️ [PERF] Condition processing: {condition_processing_time:.2f}ms")
+        log.logs.info(f"📊 [PERF] Generated {len(filter_conditions)} filter conditions, {len(mongodb_conditions)} MongoDB conditions")
+
+        # Apply all conditions in batches for better performance
+        condition_application_start = time.time()
+        if filter_conditions:
+            if len(filter_conditions) == 1:
+                self.model = self.model.where(filter_conditions[0])
+            else:
+                self.model = self.model.where(and_(*filter_conditions))
+        
+        # Apply MongoDB conditions
+        mongodb_start = time.time()
+        for field_name, operators_dict in mongodb_conditions:
+            log.logs.debug(f"🔍 [PERF] Applying MongoDB operators for {field_name}")
+            self._apply_mongodb_operators(field_name, operators_dict)
+        
+        mongodb_time = (time.time() - mongodb_start) * 1000
+        condition_application_time = (time.time() - condition_application_start) * 1000
+        total_filter_time = (time.time() - filter_start) * 1000
+        
+        log.logs.info(f"⏱️ [PERF] Condition application: {condition_application_time:.2f}ms")
+        log.logs.info(f"⏱️ [PERF] MongoDB operators: {mongodb_time:.2f}ms")
+        log.logs.info(f"✅ [PERF] OptimizedQueries.filter completed: {total_filter_time:.2f}ms")
+
+        return self
+    
+    def _build_django_filter(self, key: str, value: Any) -> Optional[Any]:
+        """Build Django-style filter condition."""
+        field_name = key.split("__")[0]
+        operator = key.split("__")[1] if "__" in key else None
+        
+        if not hasattr(self.model_class, field_name):
+            return None
+            
+        field = getattr(self.model_class, field_name)
+        
+        if operator == "gte":
+            return field >= value
+        elif operator == "gt":
+            return field > value
+        elif operator == "lte":
+            return field <= value
+        elif operator == "lt":
+            return field < value
+        elif operator == "icontains":
+            return field.ilike(f"%{value}%")
+        elif operator == "contains":
+            return field.contains(value)
+        elif operator == "in":
+            if isinstance(value, (list, tuple)):
+                return field.in_(value)
+            else:
+                log.logs.warning(f"in operator requires a list/array, got {type(value)}")
+                return None
+        elif operator == "nin":
+            if isinstance(value, (list, tuple)):
+                return ~field.in_(value)
+            else:
+                log.logs.warning(f"nin operator requires a list/array, got {type(value)}")
+                return None
+        
+        return None
+    
+    def _apply_mongodb_operators(self, field_name: str, operators_dict: Dict[str, Any]):
+        """Apply MongoDB-style operators to a specific field with performance logging."""
+        operator_start = time.time()
+        log.logs.debug(f"🔍 [PERF] Applying MongoDB operators for {field_name}: {list(operators_dict.keys())}")
+        
+        if not hasattr(self.model_class, field_name):
+            log.logs.warning(
+                f"Field '{field_name}' not found in model {self.model_class.__name__}"
+            )
+            return
+
+        field = getattr(self.model_class, field_name)
+        conditions = []
+
+        condition_building_start = time.time()
+        for operator, value in operators_dict.items():
+            try:
+                if operator == "$eq":
+                    conditions.append(field == value)
+                elif operator == "$ne":
+                    conditions.append(field != value)
+                elif operator == "$gt":
+                    conditions.append(field > value)
+                elif operator == "$gte":
+                    conditions.append(field >= value)
+                elif operator == "$lt":
+                    conditions.append(field < value)
+                elif operator == "$lte":
+                    conditions.append(field <= value)
+                elif operator == "$in":
+                    if isinstance(value, (list, tuple)):
+                        log.logs.debug(f"🔍 [PERF] $in operator with {len(value)} values")
+                        conditions.append(field.in_(value))
+                    else:
+                        log.logs.warning(
+                            f"$in operator requires a list/array, got {type(value)}"
+                        )
+                elif operator == "$nin":
+                    if isinstance(value, (list, tuple)):
+                        log.logs.debug(f"🔍 [PERF] $nin operator with {len(value)} values")
+                        conditions.append(~field.in_(value))
+                    else:
+                        log.logs.warning(
+                            f"$nin operator requires a list/array, got {type(value)}"
+                        )
+                elif operator == "$regex":
+                    # Use ILIKE for case-insensitive regex-like matching
+                    conditions.append(field.ilike(f"%{value}%"))
+                elif operator == "$iregex":
+                    # Case-insensitive regex
+                    conditions.append(field.ilike(f"%{value}%"))
+                elif operator == "$exists":
+                    if value:
+                        conditions.append(field.is_not(None))
+                    else:
+                        conditions.append(field.is_(None))
+                elif operator == "$size":
+                    # For JSON array fields - check array size
+                    conditions.append(func.json_array_length(field) == value)
+                elif operator == "$all":
+                    # For JSON array fields - check if all values exist
+                    if isinstance(value, (list, tuple)):
+                        for item in value:
+                            conditions.append(func.json_contains(field, f'"{item}"'))
+                    else:
+                        log.logs.warning(
+                            f"$all operator requires a list/array, got {type(value)}"
+                        )
+                elif operator == "$elemMatch":
+                    # For JSON array fields with object elements
+                    log.logs.warning(
+                        "$elemMatch operator not fully implemented for SQL"
+                    )
+                elif operator == "$type":
+                    # Type checking - basic implementation
+                    if value == "string":
+                        conditions.append(field.is_not(None))
+                    elif value == "number":
+                        conditions.append(field.is_not(None))
+                    # Add more type checks as needed
+                else:
+                    log.logs.warning(f"Unsupported MongoDB operator: {operator}")
+
+            except Exception as e:
+                log.logs.error(
+                    f"Error applying operator '{operator}' to field '{field_name}': {e}"
+                )
+                continue
+
+        condition_building_time = (time.time() - condition_building_start) * 1000
+        log.logs.debug(f"⏱️ [PERF] Condition building for {field_name}: {condition_building_time:.2f}ms")
+
+        # Apply all conditions for this field
+        condition_application_start = time.time()
+        if conditions:
+            if len(conditions) == 1:
+                self.model = self.model.where(conditions[0])
+            else:
+                # Multiple conditions for same field are ANDed together
+                self.model = self.model.where(and_(*conditions))
+        
+        condition_application_time = (time.time() - condition_application_start) * 1000
+        total_operator_time = (time.time() - operator_start) * 1000
+        
+        log.logs.debug(f"⏱️ [PERF] Condition application for {field_name}: {condition_application_time:.2f}ms")
+        log.logs.debug(f"✅ [PERF] MongoDB operators for {field_name} completed: {total_operator_time:.2f}ms ({len(conditions)} conditions)")
+    
+    
+    def _apply_top_level_mongodb_operators(self, operator: str, value: Any):
+        """Optimized top-level MongoDB operators."""
+        try:
+            if operator == "$or" and isinstance(value, list):
+                or_conditions = []
+                for condition_dict in value:
+                    field_conditions = self._parse_condition_dict(condition_dict)
+                    or_conditions.extend(field_conditions)
+                if or_conditions:
+                    self.model = self.model.where(or_(*or_conditions))
+                    
+            elif operator == "$and" and isinstance(value, list):
+                and_conditions = []
+                for condition_dict in value:
+                    field_conditions = self._parse_condition_dict(condition_dict)
+                    and_conditions.extend(field_conditions)
+                if and_conditions:
+                    self.model = self.model.where(and_(*and_conditions))
+                    
+            elif operator == "$nor" and isinstance(value, list):
+                nor_conditions = []
+                for condition_dict in value:
+                    field_conditions = self._parse_condition_dict(condition_dict)
+                    nor_conditions.extend(field_conditions)
+                if nor_conditions:
+                    self.model = self.model.where(not_(or_(*nor_conditions)))
+                    
+        except Exception as e:
+            log.logs.error(f"Error applying top-level operator '{operator}': {e}")
+    
+    def _parse_condition_dict(self, condition_dict: Dict[str, Any]) -> List[Any]:
+        """
+        Parse a condition dictionary and return SQLAlchemy conditions.
+        Using exact same logic as old Queries class.
+
+        Args:
+            condition_dict: Dictionary like {"name": "John", "age": {"$gt": 25}}
+
+        Returns:
+            List of SQLAlchemy condition objects
+        """
+        conditions = []
+
+        for field_name, field_value in condition_dict.items():
+            if not hasattr(self.model_class, field_name):
+                log.logs.warning(
+                    f"Field '{field_name}' not found in model {self.model_class.__name__}"
+                )
+                continue
+
+            field = getattr(self.model_class, field_name)
+
+            try:
+                if isinstance(field_value, dict) and any(
+                    k.startswith("$") for k in field_value.keys()
+                ):
+                    # Handle operators like {"age": {"$gt": 25}}
+                    for operator, value in field_value.items():
+                        if operator == "$eq":
+                            conditions.append(field == value)
+                        elif operator == "$ne":
+                            conditions.append(field != value)
+                        elif operator == "$gt":
+                            conditions.append(field > value)
+                        elif operator == "$gte":
+                            conditions.append(field >= value)
+                        elif operator == "$lt":
+                            conditions.append(field < value)
+                        elif operator == "$lte":
+                            conditions.append(field <= value)
+                        elif operator == "$in":
+                            if isinstance(value, (list, tuple)):
+                                conditions.append(field.in_(value))
+                        elif operator == "$nin":
+                            if isinstance(value, (list, tuple)):
+                                conditions.append(~field.in_(value))
+                        elif operator == "$regex":
+                            conditions.append(field.ilike(f"%{value}%"))
+                        elif operator == "$exists":
+                            if value:
+                                conditions.append(field.is_not(None))
+                            else:
+                                conditions.append(field.is_(None))
+                        # Add more operators as needed
+                else:
+                    # Simple equality: {"name": "John"}
+                    conditions.append(field == field_value)
+
+            except Exception as e:
+                log.logs.error(f"Error parsing condition for field '{field_name}': {e}")
+                continue
+
+        return conditions
+    
+    def sort(self):
+        """Optimized sorting with index hints."""
+        if "sort" in self.request_query:
+            sort_fields = self.request_query["sort"].split(",")
+            order_clauses = []
+            
+            for field in sort_fields:
+                try:
+                    if field.startswith("-"):
+                        field_name = field[1:]
+                        if hasattr(self.model_class, field_name):
+                            order_clauses.append(getattr(self.model_class, field_name).desc())
+                    else:
+                        if hasattr(self.model_class, field):
+                            order_clauses.append(getattr(self.model_class, field).asc())
+                except Exception as e:
+                    log.logs.warning(f"Error applying sort for field '{field}': {e}")
+                    continue
+            
+            if order_clauses:
+                self.model = self.model.order_by(*order_clauses)
+        else:
+            # Optimized default sorting
+            if hasattr(self.model_class, "created_at"):
+                self.model = self.model.order_by(getattr(self.model_class, "created_at").desc())
+            elif hasattr(self.model_class, "id"):
+                self.model = self.model.order_by(getattr(self.model_class, "id").desc())
+
+        return self
+    
+    def limit_fields(self):
+        """Optimized field limiting with caching."""
+        if "fields" in self.request_query:
+            fields = self.request_query["fields"].split(",")
+            valid_fields = []
+            
+            for field in fields:
+                if hasattr(self.model_class, field):
+                    valid_fields.append(getattr(self.model_class, field))
+
+            if valid_fields:
+                self.model = self.model.with_only_columns(*valid_fields)
+        return self
+    
+    def paginate(self):
+        """Optimized pagination with cursor-based pagination support."""
+        try:
+            page = max(1, int(self.request_query.get("page", 1)))
+            limit = min(1000, max(1, int(self.request_query.get("limit", 100))))
+            
+            # Use cursor-based pagination for better performance on large datasets
+            if page > 1 and "cursor" in self.request_query:
+                cursor_value = self.request_query["cursor"]
+                cursor_field = self.request_query.get("cursor_field", "id")
+                if hasattr(self.model_class, cursor_field):
+                    self.model = self.model.where(
+                        getattr(self.model_class, cursor_field) > cursor_value
+                    )
+            
+            offset = (page - 1) * limit
+            self.model = self.model.offset(offset).limit(limit)
+            
+        except (ValueError, TypeError):
+            log.logs.warning("Invalid pagination parameters, using defaults")
+            self.model = self.model.offset(0).limit(100)
+
+        return self
+    
+    def optimize_query(self):
+        """Apply query optimizations."""
+        # Add query hints for better performance
+        if hasattr(self.model, 'with_hint'):
+            # Add database-specific hints if supported
+            pass
+        
+        # Optimize joins if any
+        self._optimize_joins()
+        
+        return self
+    
+    def _optimize_joins(self):
+        """Optimize join operations."""
+        # This would contain database-specific join optimizations
+        # For now, we'll keep it simple
+        pass
+    
+    async def execute_with_cache(self, db: AsyncSession, cache_ttl: int = 300) -> Any:
+        """Execute query without caching (caching disabled)."""
+        # Execute query directly without caching
+        try:
+            result = await db.execute(self.model)
+            data = result.scalars().all()
+            return data
+        except Exception as e:
+            log.logs.error(f"Query execution error: {e}")
+            raise
+    
+    def get_query_plan(self) -> Dict[str, Any]:
+        """Get query execution plan for optimization."""
+        return {
+            'model': self.model_class.__name__,
+            'filters': len(self.request_query.get('filters', {})),
+            'sort_fields': len(self.request_query.get('sort', '').split(',')),
+            'pagination': {
+                'page': self.request_query.get('page', 1),
+                'limit': self.request_query.get('limit', 100)
+            },
+            'fields': self.request_query.get('fields', 'all')
+        }

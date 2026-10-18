@@ -1,0 +1,571 @@
+"""
+Redis Cache Manager for June Pharmacy Platform
+
+Provides caching functionality with Redis backend for improved performance.
+Includes decorator for easy function result caching.
+"""
+
+import asyncio
+import hashlib
+import json
+import pickle
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
+
+try:
+    from redis.asyncio import Redis as RedisClient
+    from redis.exceptions import ConnectionError, RedisError, TimeoutError
+
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    RedisClient = None
+    ConnectionError = Exception
+    TimeoutError = Exception
+    RedisError = Exception
+
+from app.utils.logger.log import logs
+
+
+class CacheManager:
+    """
+    Async Redis cache manager with support for caching function results
+    """
+
+    def __init__(self):
+        self.redis: Optional["Redis"] = None
+        self.enabled = False
+        self._connection_retries = 0
+        self._max_retries = 3
+
+    async def init(
+        self,
+        redis_url: str,
+        enabled: bool = True,
+        max_retries: int = 3,
+        retry_delay: int = 2,
+    ):
+        """
+        Initialize Redis connection with retry logic
+
+        Args:
+            redis_url: Redis connection URL (e.g., redis://user:pass@host:port or host:port)
+            enabled: Whether caching is enabled
+            max_retries: Maximum connection retry attempts
+            retry_delay: Delay between retries in seconds
+        """
+        self.enabled = enabled and REDIS_AVAILABLE
+        self._max_retries = max_retries
+
+        if not REDIS_AVAILABLE:
+            logs.warning("Redis library not installed. Caching will be disabled.")
+            return
+
+        if not enabled:
+            logs.info("Caching is disabled")
+            return
+
+        # Parse Redis URL to extract components
+        host = "localhost"
+        port = 6379
+        username = None
+        password = None
+        db = 0
+        ssl = False
+
+        try:
+            if redis_url.startswith(("redis://", "rediss://")):
+                # Parse full URL: redis://[username:password@]host:port[/db]
+                ssl = redis_url.startswith("rediss://")
+                url_without_scheme = redis_url.split("://", 1)[1]
+                
+                # Extract auth if present
+                if "@" in url_without_scheme:
+                    auth_part, host_part = url_without_scheme.split("@", 1)
+                    if ":" in auth_part:
+                        username, password = auth_part.split(":", 1)
+                    else:
+                        password = auth_part  # Just password, no username
+                else:
+                    host_part = url_without_scheme
+                
+                # Extract host, port, and db
+                if "/" in host_part:
+                    host_port, db_str = host_part.split("/", 1)
+                    db = int(db_str) if db_str else 0
+                else:
+                    host_port = host_part
+                
+                if ":" in host_port:
+                    host, port_str = host_port.rsplit(":", 1)
+                    port = int(port_str)
+                else:
+                    host = host_port
+            else:
+                # Simple format: host:port
+                if ":" in redis_url:
+                    host, port_str = redis_url.rsplit(":", 1)
+                    port = int(port_str)
+                else:
+                    host = redis_url
+        except Exception as e:
+            logs.error(f"Failed to parse Redis URL: {e}")
+            self.enabled = False
+            return
+
+        # Retry connection logic
+        for attempt in range(max_retries):
+            try:
+                assert RedisClient is not None  # Type guard for mypy
+
+                logs.info(
+                    f"Connecting to Redis at {host}:{port} (attempt {attempt + 1}/{max_retries})"
+                )
+
+                # Use direct connection parameters with reduced pool size
+                self.redis = RedisClient(
+                    host=host,
+                    port=port,
+                    db=db,
+                    username=username if username else None,
+                    password=password if password else None,
+                    decode_responses=False,  # We handle encoding ourselves
+                    encoding="utf-8",
+                    socket_connect_timeout=10,
+                    socket_timeout=10,
+                    socket_keepalive=False,  # Disable problematic keepalive
+                    max_connections=10,  # Reduced from 50 to avoid "max clients" errors
+                    health_check_interval=30,
+                    ssl=ssl,
+                )
+
+                # Test connection
+                await asyncio.wait_for(self.redis.ping(), timeout=10)
+
+                logs.info("✓ Redis cache initialized successfully")
+                self._connection_retries = 0
+                return
+
+            except asyncio.TimeoutError:
+                logs.error(
+                    f"Redis connection timeout on attempt {attempt + 1}/{max_retries}"
+                )
+                if self.redis:
+                    try:
+                        await self.redis.close()
+                    except Exception:
+                        pass
+                    self.redis = None
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+
+            except ConnectionError as e:
+                logs.error(
+                    f"Redis connection error on attempt {attempt + 1}/{max_retries}: {e}"
+                )
+                if self.redis:
+                    try:
+                        await self.redis.close()
+                    except Exception:
+                        pass
+                    self.redis = None
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+
+            except Exception as e:
+                logs.error(
+                    f"Failed to initialize Redis cache on attempt {attempt + 1}/{max_retries}: {e}"
+                )
+                if self.redis:
+                    try:
+                        await self.redis.close()
+                    except Exception:
+                        pass
+                    self.redis = None
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+
+        # All retries failed
+        logs.warning("⚠ All Redis connection attempts failed. Running without cache.")
+        self.enabled = False
+        self.redis = None
+
+    async def _ensure_connection(self) -> bool:
+        """Ensure Redis connection is alive"""
+        if not self.enabled or not self.redis:
+            return False
+
+        try:
+            await asyncio.wait_for(self.redis.ping(), timeout=5)
+            return True
+        except Exception as e:
+            logs.warning(f"Redis connection lost: {e}. Disabling cache temporarily.")
+            return False
+
+    def _normalize_for_cache(self, value: Any) -> Any:
+        """
+        Normalize data for caching - handle SQLModel objects, dictionaries, and mixed types
+        
+        Args:
+            value: The value to normalize
+            
+        Returns:
+            Normalized value suitable for JSON serialization
+        """
+        if value is None:
+            return None
+            
+        # Handle dictionaries (like response_message format)
+        if isinstance(value, dict):
+            normalized_dict = {}
+            for k, v in value.items():
+                if k == "data" and v is not None:
+                    # Handle data field specially
+                    if isinstance(v, list):
+                        # List of objects
+                        normalized_dict[k] = [
+                            self._normalize_single_object(item) for item in v
+                        ]
+                    else:
+                        # Single object
+                        normalized_dict[k] = self._normalize_single_object(v)
+                else:
+                    # Other fields
+                    normalized_dict[k] = self._normalize_single_object(v)
+            return normalized_dict
+            
+        # Handle lists
+        elif isinstance(value, list):
+            return [self._normalize_single_object(item) for item in value]
+            
+        # Handle single objects
+        else:
+            return self._normalize_single_object(value)
+    
+    def _normalize_single_object(self, obj: Any) -> Any:
+        """
+        Normalize a single object for caching
+        
+        Args:
+            obj: Object to normalize
+            
+        Returns:
+            Normalized object
+        """
+        if obj is None:
+            return None
+            
+        # Handle SQLModel objects (objects with to_dict method)
+        if hasattr(obj, 'to_dict') and callable(getattr(obj, 'to_dict')):
+            try:
+                return obj.to_dict()
+            except Exception as e:
+                logs.warning(f"Failed to convert object to dict: {e}")
+                return str(obj)
+                
+        # Handle dictionaries
+        elif isinstance(obj, dict):
+            return obj
+            
+        # Handle basic types
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+            
+        # Handle datetime objects
+        elif hasattr(obj, 'isoformat'):
+            return obj.isoformat()
+            
+        # Fallback: convert to string
+        else:
+            return str(obj)
+
+    async def get(self, key: str) -> Optional[Any]:
+        """
+        Get value from cache
+
+        Args:
+            key: Cache key
+
+        Returns:
+            Cached value or None if not found
+        """
+        if not self.enabled or not self.redis:
+            return None
+
+        try:
+            # Check connection before attempting to get
+            if not await self._ensure_connection():
+                return None
+                
+            value = await asyncio.wait_for(self.redis.get(key), timeout=5)
+            if value is None:
+                return None
+
+            # Try to deserialize
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                # Fallback to pickle for complex objects
+                return pickle.loads(value)
+        except asyncio.TimeoutError:
+            logs.warning(f"Cache get timeout for key {key}")
+            return None
+        except Exception as e:
+            logs.error(f"Cache get error for key {key}: {e}")
+            return None
+
+    async def set(self, key: str, value: Any, expire: int = 300) -> bool:
+        """
+        Set value in cache
+
+        Args:
+            key: Cache key
+            value: Value to cache
+            expire: Expiration time in seconds (default: 5 minutes)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.enabled or not self.redis:
+            return False
+
+        try:
+            # Check connection before attempting to set
+            if not await self._ensure_connection():
+                return False
+
+            # Normalize value for caching
+            normalized_value = self._normalize_for_cache(value)
+            
+            # Try to serialize as JSON first
+            try:
+                serialized = json.dumps(normalized_value)
+            except (TypeError, ValueError):
+                # Fallback to pickle for complex objects
+                serialized = pickle.dumps(normalized_value)
+
+            await asyncio.wait_for(
+                self.redis.set(key, serialized, ex=expire), timeout=5
+            )
+            return True
+        except asyncio.TimeoutError:
+            logs.warning(f"Cache set timeout for key {key}")
+            return False
+        except Exception as e:
+            logs.error(f"Cache set error for key {key}: {e}")
+            return False
+
+    async def delete(self, key: str) -> bool:
+        """
+        Delete key from cache
+
+        Args:
+            key: Cache key
+
+        Returns:
+            True if key was deleted, False otherwise
+        """
+        if not self.enabled or not self.redis:
+            return False
+
+        try:
+            await asyncio.wait_for(self.redis.delete(key), timeout=5)
+            return True
+        except asyncio.TimeoutError:
+            logs.warning(f"Cache delete timeout for key {key}")
+            return False
+        except Exception as e:
+            logs.error(f"Cache delete error for key {key}: {e}")
+            return False
+
+    async def delete_pattern(self, pattern: str) -> int:
+        """
+        Delete all keys matching pattern
+
+        Args:
+            pattern: Key pattern (e.g., "user:*")
+
+        Returns:
+            Number of keys deleted
+        """
+        if not self.enabled or not self.redis:
+            return 0
+
+        try:
+            keys = []
+            async for key in self.redis.scan_iter(match=pattern):
+                keys.append(key)
+
+            if keys:
+                return await asyncio.wait_for(self.redis.delete(*keys), timeout=10)
+            return 0
+        except asyncio.TimeoutError:
+            logs.warning(f"Cache delete pattern timeout for pattern {pattern}")
+            return 0
+        except Exception as e:
+            logs.error(f"Cache delete pattern error for pattern {pattern}: {e}")
+            return 0
+
+    async def exists(self, key: str) -> bool:
+        """
+        Check if key exists in cache
+
+        Args:
+            key: Cache key
+
+        Returns:
+            True if key exists, False otherwise
+        """
+        if not self.enabled or not self.redis:
+            return False
+
+        try:
+            result = await asyncio.wait_for(self.redis.exists(key), timeout=5)
+            return result > 0
+        except asyncio.TimeoutError:
+            logs.warning(f"Cache exists timeout for key {key}")
+            return False
+        except Exception as e:
+            logs.error(f"Cache exists error for key {key}: {e}")
+            return False
+
+    async def clear_all(self) -> bool:
+        """
+        Clear all cache (use with caution!)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.enabled or not self.redis:
+            return False
+
+        try:
+            await asyncio.wait_for(self.redis.flushdb(), timeout=10)
+            logs.info("Cache cleared successfully")
+            return True
+        except asyncio.TimeoutError:
+            logs.warning("Cache clear timeout")
+            return False
+        except Exception as e:
+            logs.error(f"Cache clear error: {e}")
+            return False
+
+    async def close(self):
+        """Close Redis connection"""
+        if self.redis:
+            await self.redis.close()
+            await self.redis.connection_pool.disconnect()
+            logs.info("Redis cache connection closed")
+
+
+# Global cache manager instance
+cache_manager = CacheManager()
+
+
+def cached(key_prefix: str, expire: int = 300, key_builder: Optional[Callable] = None):
+    """
+    Decorator for caching async function results
+
+    Args:
+        key_prefix: Prefix for cache key
+        expire: Expiration time in seconds (default: 5 minutes)
+        key_builder: Optional custom function to build cache key from args
+
+    Example:
+        @cached(key_prefix="user", expire=600)
+        async def get_user(user_id: str):
+            return await db.get_user(user_id)
+
+        # With custom key builder
+        @cached(
+            key_prefix="analytics",
+            expire=1800,
+            key_builder=lambda pharmacy_id, date: f"analytics:{pharmacy_id}:{date}"
+        )
+        async def get_analytics(pharmacy_id: str, date: str):
+            return await calculate_analytics(pharmacy_id, date)
+    """
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Build cache key
+            if key_builder:
+                try:
+                    cache_key = key_builder(*args, **kwargs)
+                except Exception as e:
+                    logs.error(f"Error building cache key: {e}")
+                    # Fallback to default key builder
+                    key_parts = f"{key_prefix}:{args}:{sorted(kwargs.items())}"
+                    cache_key = (
+                        f"{key_prefix}:{hashlib.md5(key_parts.encode()).hexdigest()}"
+                    )
+            else:
+                # Default key builder - hash args and kwargs
+                key_parts = f"{key_prefix}:{args}:{sorted(kwargs.items())}"
+                cache_key = (
+                    f"{key_prefix}:{hashlib.md5(key_parts.encode()).hexdigest()}"
+                )
+
+            # Try to get from cache
+            cached_value = await cache_manager.get(cache_key)
+            if cached_value is not None:
+                logs.debug(f"Cache HIT for key: {cache_key}")
+                return cached_value
+
+            logs.debug(f"Cache MISS for key: {cache_key}")
+
+            # Execute function
+            result = await func(*args, **kwargs)
+
+            # Store in cache (non-blocking, don't wait for result)
+            asyncio.create_task(cache_manager.set(cache_key, result, expire))
+
+            return result
+
+        # Add cache invalidation method
+        wrapper.invalidate = lambda *args, **kwargs: _invalidate_cache(  # type: ignore[attr-defined]
+            key_prefix, key_builder, args, kwargs
+        )
+
+        return wrapper
+
+    return decorator
+
+
+async def _invalidate_cache(
+    key_prefix: str, key_builder: Optional[Callable], args: tuple, kwargs: dict
+):
+    """Helper to invalidate cache for specific function call"""
+    if key_builder:
+        try:
+            cache_key = key_builder(*args, **kwargs)
+        except Exception:
+            key_parts = f"{key_prefix}:{args}:{sorted(kwargs.items())}"
+            cache_key = f"{key_prefix}:{hashlib.md5(key_parts.encode()).hexdigest()}"
+    else:
+        key_parts = f"{key_prefix}:{args}:{sorted(kwargs.items())}"
+        cache_key = f"{key_prefix}:{hashlib.md5(key_parts.encode()).hexdigest()}"
+
+    await cache_manager.delete(cache_key)
+
+
+# Convenience function for manual cache management
+async def invalidate_cache_pattern(pattern: str):
+    """
+    Invalidate all cache keys matching pattern
+
+    Example:
+        await invalidate_cache_pattern("user:*")
+        await invalidate_cache_pattern("analytics:pharmacy_123:*")
+    """
+    return await cache_manager.delete_pattern(pattern)
