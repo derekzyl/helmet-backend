@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 import httpx
 import websockets
 
-API_BASE_URL = "http://localhost:8000/api/v1"
-WS_URL = "ws://localhost:8000/api/v1/ws/live"
+API_BASE_URL = "https://big-mariejeanne-cybergenii-b60e7032.koyeb.app/api/v1"
+WS_URL = "wss://big-mariejeanne-cybergenii-b60e7032.koyeb.app/api/v1/ws/live"
 
 
 class HardwareSimulator:
